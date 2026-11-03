@@ -3,6 +3,7 @@ from collections import Counter
 import csv
 import dataclasses
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
 import math
@@ -19,6 +20,28 @@ import time
 KV_BYTES_PER_TOKEN = 2 * 32 * 32 * 128 * 2
 TOKEN_BUDGET = 2048
 OUTPUT_LEN = 128
+SIMULATOR_FIELDS = [
+    "input_tokens",
+    "requested_batch",
+    "active_batch",
+    "phase",
+    "prefill_chunk_index",
+    "decode_step_index_min",
+    "decode_step_index_max",
+    "context_before_tokens_min",
+    "context_before_tokens_max",
+    "context_after_tokens_min",
+    "context_after_tokens_max",
+    "scheduled_tokens_per_request_min",
+    "scheduled_tokens_per_request_max",
+    "steps_per_run",
+    "repetitions",
+    "executor_cuda_repetitions",
+] + [
+    metric + "_" + stat
+    for metric in ["engine_wall_ms", "executor_cuda_span_ms"]
+    for stat in ["median", "min", "max"]
+]
 
 
 class ThermalStop(RuntimeError):
@@ -53,10 +76,186 @@ def checkpoint_dtypes(path):
     return dict(counts)
 
 
+def read_runs(path):
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt") as stream:
+        return [json.loads(line) for line in stream]
+
+
+def summarize(path):
+    groups = {}
+    for row in read_runs(path):
+        if row.get("kind") != "measured" or row.get("status") != "ok":
+            continue
+        key = row["input_tokens"], row["requested_batch"]
+        values = row["prefill_engine_ms"], row["decode_engine_step_mean_ms"]
+        if not all(math.isfinite(value) and value > 0 for value in values):
+            raise ValueError(f"Invalid times for {key}")
+        repeats = groups.setdefault(key, {})
+        if row["repeat"] in repeats:
+            raise ValueError(f"Duplicate repeat for {key}")
+        repeats[row["repeat"]] = values
+    if not groups or any(len(repeats) < 3 for repeats in groups.values()):
+        raise ValueError("Need at least three measured repeats per cell")
+    lines = [
+        "| Вход, токенов на запрос | Batch | Prefill, мс | Шаг decode, мс |",
+        "| ---: | ---: | ---: | ---: |",
+    ]
+    for (length, batch), repeats in sorted(groups.items()):
+        prefill, decode = (
+            statistics.median(values) for values in zip(*repeats.values())
+        )
+        times = f"{prefill:.2f} | {decode:.2f}".replace(".", ",")
+        lines.append(f"| {length} | {batch} | {times} |")
+    return "\n".join(lines)
+
+
+def simulator_steps(rows):
+    groups, repeats = {}, {}
+    for run in rows:
+        if run.get("kind") != "measured" or run.get("status") != "ok":
+            continue
+        cell = run["input_tokens"], run["requested_batch"]
+        seen = repeats.setdefault(cell, set())
+        if run["repeat"] in seen:
+            raise ValueError(f"Duplicate repeat for {cell}")
+        seen.add(run["repeat"])
+        length, batch = cell
+        chunk, output = (
+            run["prefill_chunk_limit_per_request"],
+            run["output_tokens_per_request"],
+        )
+        if min(length, batch, chunk, output) <= 0:
+            raise ValueError(f"Invalid dimensions for {cell}")
+        steps = run["steps"]
+        if len(steps) != math.ceil(length / chunk) + output - 1:
+            raise ValueError(f"Incomplete steps for {cell}")
+        computed = 0
+        for step in steps:
+            phase = "prefill" if computed < length else "decode"
+            count = min(chunk, length - computed) if phase == "prefill" else 1
+            if (
+                step["phase"] != phase
+                or step["active_batch"] != batch
+                or len(step["scheduled"]) != batch
+                or any(
+                    r["computed_before"] != computed or r["scheduled_tokens"] != count
+                    for r in step["scheduled"]
+                )
+            ):
+                raise ValueError(f"Inconsistent step geometry for {cell}")
+            wall, cuda = (
+                step["engine_step_wall_ms"],
+                step["forward_executor_cuda_span_ms"],
+            )
+            if (
+                not math.isfinite(wall)
+                or wall <= 0
+                or (cuda is not None and (not math.isfinite(cuda) or cuda <= 0))
+            ):
+                raise ValueError(f"Invalid step time for {cell}")
+            computed += count
+        prefills = [step for step in steps if step["phase"] == "prefill"]
+        decodes = [step for step in steps if step["phase"] == "decode"]
+        parts = [
+            ("prefill", index, [step], "", "") for index, step in enumerate(prefills)
+        ]
+        parts += [
+            (
+                "decode",
+                index,
+                decodes[start : start + 32],
+                start,
+                min(start + 31, len(decodes) - 1),
+            )
+            for index, start in enumerate(range(0, len(decodes), 32))
+        ]
+        for phase, index, steps, first_decode, last_decode in parts:
+            requests = [request for step in steps for request in step["scheduled"]]
+            before = [r["computed_before"] for r in requests]
+            after = [r["computed_before"] + r["scheduled_tokens"] for r in requests]
+            scheduled = [r["scheduled_tokens"] for r in requests]
+            geometry = (
+                min(before),
+                max(before),
+                min(after),
+                max(after),
+                min(scheduled),
+                max(scheduled),
+            )
+            key = (*cell, phase, index, batch, *geometry)
+            cuda = [step["forward_executor_cuda_span_ms"] for step in steps]
+            sample = {
+                "decode_step_index_min": first_decode,
+                "decode_step_index_max": last_decode,
+                "steps_per_run": len(steps),
+                "engine_wall_ms": statistics.mean(
+                    step["engine_step_wall_ms"] for step in steps
+                ),
+                "executor_cuda_span_ms": (
+                    statistics.mean(cuda) if all(v is not None for v in cuda) else None
+                ),
+            }
+            groups.setdefault(key, []).append(sample)
+    if not repeats or any(len(seen) < 3 for seen in repeats.values()):
+        raise ValueError("Need at least three measured repeats per cell")
+    output = []
+    for key, samples in sorted(
+        groups.items(),
+        key=lambda item: (item[0][0], item[0][1], item[0][2] != "prefill", item[0][3:]),
+    ):
+        length, requested, phase, index, active, *geometry = key
+        if len(samples) != len(repeats[length, requested]):
+            raise ValueError(
+                f"Step geometry differs between repeats for {(length, requested)}"
+            )
+        row = {
+            "input_tokens": length,
+            "requested_batch": requested,
+            "active_batch": active,
+            "phase": phase,
+            "prefill_chunk_index": index if phase == "prefill" else "",
+            **{
+                name: samples[0][name]
+                for name in [
+                    "decode_step_index_min",
+                    "decode_step_index_max",
+                    "steps_per_run",
+                ]
+            },
+            **dict(zip(SIMULATOR_FIELDS[7:13], geometry)),
+            "repetitions": len(samples),
+            "executor_cuda_repetitions": sum(
+                sample["executor_cuda_span_ms"] is not None for sample in samples
+            ),
+        }
+        for metric in ["engine_wall_ms", "executor_cuda_span_ms"]:
+            values = [
+                sample[metric] for sample in samples if sample[metric] is not None
+            ]
+            for stat, function in [
+                ("median", statistics.median),
+                ("min", min),
+                ("max", max),
+            ]:
+                row[metric + "_" + stat] = function(values) if values else ""
+        output.append(row)
+    return output
+
+
 def self_check():
-    assert cooling_decision(95, "Not Active", "Not Active", 0)[1] == "temperature_at_least_95C"
-    assert cooling_decision(88, "Not Active", "Not Active", 2)[1] == "sustained_heat_or_thermal_slowdown"
-    assert cooling_decision(70, "Active", "Not Active", 2)[1] == "sustained_heat_or_thermal_slowdown"
+    assert (
+        cooling_decision(95, "Not Active", "Not Active", 0)[1]
+        == "temperature_at_least_95C"
+    )
+    assert (
+        cooling_decision(88, "Not Active", "Not Active", 2)[1]
+        == "sustained_heat_or_thermal_slowdown"
+    )
+    assert (
+        cooling_decision(70, "Active", "Not Active", 2)[1]
+        == "sustained_heat_or_thermal_slowdown"
+    )
     assert cooling_decision(70, "Not Active", "Not Active", 2) == (0, None)
     assert KV_BYTES_PER_TOKEN == 524288
     assert KV_BYTES_PER_TOKEN / 1024 == 512
@@ -67,9 +266,87 @@ def self_check():
     assert classify(128 + 126, 128, 1) == (0, 1)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "header.safetensors"
-        header = json.dumps({"__metadata__": {}, "weight": {"dtype": "F16", "shape": [2, 3]}}).encode()
+        header = json.dumps(
+            {"__metadata__": {}, "weight": {"dtype": "F16", "shape": [2, 3]}}
+        ).encode()
         path.write_bytes(len(header).to_bytes(8, "little") + header)
         assert checkpoint_dtypes(path) == {"F16": 6}
+        path = Path(directory) / "runs.jsonl"
+        rows = [
+            {
+                "kind": "measured",
+                "status": "ok",
+                "input_tokens": 128,
+                "requested_batch": 1,
+                "repeat": repeat,
+                "prefill_engine_ms": value,
+                "decode_engine_step_mean_ms": value / 2,
+            }
+            for repeat, value in enumerate([100, 2, 4])
+        ]
+        rows.append({"kind": "warmup", "status": "ok"})
+        path.write_text("\n".join(json.dumps(row) for row in rows))
+        assert summarize(path).splitlines()[-1] == "| 128 | 1 | 4,00 | 2,00 |"
+        compressed = path.with_suffix(".jsonl.gz")
+        compressed.write_bytes(gzip.compress(path.read_bytes(), mtime=0))
+        assert summarize(compressed) == summarize(path)
+    timed = []
+    for repeat, scale in enumerate([1, 2, 5]):
+        steps = [
+            {
+                "phase": "prefill",
+                "active_batch": 1,
+                "scheduled": [{"computed_before": start, "scheduled_tokens": 64}],
+                "engine_step_wall_ms": 10 * scale,
+                "forward_executor_cuda_span_ms": 5 * scale,
+            }
+            for start in [0, 64]
+        ]
+        steps += [
+            {
+                "phase": "decode",
+                "active_batch": 1,
+                "scheduled": [{"computed_before": 128 + index, "scheduled_tokens": 1}],
+                "engine_step_wall_ms": (index + 1) * scale,
+                "forward_executor_cuda_span_ms": (index + 1) * scale / 2,
+            }
+            for index in range(127)
+        ]
+        timed.append(
+            {
+                "kind": "measured",
+                "status": "ok",
+                "input_tokens": 128,
+                "requested_batch": 1,
+                "repeat": repeat,
+                "output_tokens_per_request": 128,
+                "prefill_chunk_limit_per_request": 64,
+                "steps": steps,
+            }
+        )
+    costs = simulator_steps(timed)
+    assert len(costs) == 6 and all(row["repetitions"] == 3 for row in costs)
+    assert costs[1]["context_before_tokens_min"] == 64
+    assert [
+        costs[2]["engine_wall_ms_" + stat] for stat in ["median", "min", "max"]
+    ] == [33, 16.5, 82.5]
+    assert costs[2]["executor_cuda_span_ms_median"] == 16.5
+    assert (
+        costs[-1]["decode_step_index_min"],
+        costs[-1]["decode_step_index_max"],
+        costs[-1]["steps_per_run"],
+    ) == (96, 126, 31)
+    for invalid in [
+        timed[:2],
+        timed + [timed[0]],
+        [{**r, "steps": r["steps"][:-1]} for r in timed],
+    ]:
+        try:
+            simulator_steps(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Invalid step measurements accepted")
 
 
 def write_json(path, value):
@@ -699,11 +976,15 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Profile LLaMA-7B FP16 with vLLM 0.11.0.")
+    parser = argparse.ArgumentParser(
+        description="Profile LLaMA-7B FP16 with vLLM 0.11.0."
+    )
     parser.add_argument("--model", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--self-check", action="store_true")
+    parser.add_argument("--summarize", type=Path)
+    parser.add_argument("--steps", type=Path)
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--minutes", type=float, default=25)
@@ -713,6 +994,19 @@ if __name__ == "__main__":
     self_check()
     if arguments.self_check:
         print("SELF_CHECK_OK")
+    elif arguments.summarize:
+        print(summarize(arguments.summarize))
+    elif arguments.steps:
+        if (
+            arguments.output is None
+            or arguments.output.resolve() == arguments.steps.resolve()
+        ):
+            parser.error("--output must name a CSV file different from the input")
+        rows = simulator_steps(read_runs(arguments.steps))
+        with arguments.output.open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=SIMULATOR_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
     else:
         if arguments.model is None or arguments.output is None:
             parser.error("--model and --output are required")
